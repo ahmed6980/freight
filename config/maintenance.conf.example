@@ -19,7 +19,7 @@ WP_CLI_EXTRA_ARGS=""
 SITE_PATHS="/var/www/html"
 
 # Public URL. Leave blank to read it from the WordPress `home` option.
-SITE_URL=""
+SITE_URL="https://afimex.com"
 
 # Extra URLs to health-check each night (landing pages, contact, search).
 HEALTH_URLS=""

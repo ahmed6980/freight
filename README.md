@@ -72,6 +72,18 @@ column -t -s$'\t' /var/log/wp-maintenance/orphan-report-*.tsv
 #    and replace --dry-run with --execute.
 ```
 
+## Step 0: run the survey
+
+Before configuring anything, run the read-only survey on the webserver. It
+changes nothing (every database call is a `SELECT`) and reports the storage
+breakdown, post types, and candidate auction-date meta keys:
+
+```bash
+./bin/site-survey.sh --path /var/www/html > survey.txt 2>&1
+```
+
+Its output tells you exactly what to put in the two settings below.
+
 ## The two settings that matter
 
 Everything else has a safe default. These two do not:
