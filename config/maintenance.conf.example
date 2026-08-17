@@ -1,0 +1,108 @@
+# Nightly maintenance configuration.
+# Copy to config/maintenance.conf and edit. This file is sourced by bash.
+#
+# The two VEHICLE_* settings under "Vehicle/auction retention" are the ones that
+# matter most: get them wrong and the job deletes live inventory. If you leave
+# them blank the script attempts detection and REFUSES to purge when the answer
+# is ambiguous — that is the intended safe failure.
+
+# ---------------------------------------------------------------------------
+# WordPress location
+# ---------------------------------------------------------------------------
+WP_PATH="/var/www/html"
+WP_CLI="wp"
+# Add --allow-root here if cron runs this as root.
+WP_CLI_EXTRA_ARGS=""
+
+# Every filesystem path that counts toward the site's storage footprint.
+# Space separated. Include separate media mounts if you have them.
+SITE_PATHS="/var/www/html"
+
+# Public URL. Leave blank to read it from the WordPress `home` option.
+SITE_URL=""
+
+# Extra URLs to health-check each night (landing pages, contact, search).
+HEALTH_URLS=""
+
+# ---------------------------------------------------------------------------
+# Storage thresholds (GiB)
+# ---------------------------------------------------------------------------
+STORAGE_LIMIT_GIB=40           # hard ceiling — never exceed
+THRESHOLD_AGGRESSIVE_GIB=35    # 35-38: aggressive optimization
+THRESHOLD_REMOVE_OLD_GIB=38    # 38-39: begin removing eligible old content
+THRESHOLD_HARD_CLEAN_GIB=39    # 39-40: aggressive removal of eligible content
+
+# ---------------------------------------------------------------------------
+# Vehicle/auction retention  <-- SET THESE
+# ---------------------------------------------------------------------------
+# The custom post type holding vehicles, e.g. "vehicle", "auction", "listing".
+# Find it with:  wp post-type list --field=name
+VEHICLE_POST_TYPE=""
+
+# The postmeta key holding the auction date. This is the authoritative date for
+# retention — NOT post_date. Find candidates with:
+#   wp db query "SELECT DISTINCT meta_key FROM wp_postmeta pm \
+#     JOIN wp_posts p ON p.ID=pm.post_id WHERE p.post_type='YOUR_TYPE';"
+# Supported value formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, or a unix timestamp.
+AUCTION_DATE_META=""
+
+# Days after the auction date before a vehicle may be permanently deleted.
+VEHICLE_RETENTION_DAYS=7
+
+# retention = enforce the 7-day policy every night (requirement 5)
+# storage   = only purge when storage crosses THRESHOLD_REMOVE_OLD_GIB (req. 3)
+VEHICLE_PURGE_MODE="retention"
+
+# SPEC CONFLICT, deliberately left safe. Requirement 5 says vehicles inside the
+# 7-day window must be preserved; requirement 2's example implies deleting down
+# to 2 days. Default = never go below VEHICLE_RETENTION_DAYS. Set to 2 only if
+# you truly want emergency mode to delete vehicles as recent as 2 days past
+# auction, and only when storage is over the hard ceiling.
+EMERGENCY_MIN_AGE_DAYS=7
+
+# Postmeta key that marks a vehicle as never-delete, whatever its age.
+VEHICLE_KEEP_META="_maintenance_keep"
+
+# Vehicles deleted per batch before storage is recalculated.
+VEHICLE_BATCH_SIZE=50
+
+# ---------------------------------------------------------------------------
+# Orphaned content
+# ---------------------------------------------------------------------------
+# false = classify and report only (recommended). Review the orphan report for
+# several nights before considering true.
+ORPHAN_AUTODELETE=false
+
+# Slugs that are never orphans regardless of inbound links.
+PROTECTED_SLUGS="privacy-policy cart checkout my-account shop terms terms-and-conditions contact about home homepage thank-you sitemap"
+
+# ---------------------------------------------------------------------------
+# Media
+# ---------------------------------------------------------------------------
+LARGE_IMAGE_BYTES=5242880        # 5 MiB — reported, never auto-deleted
+MEDIA_DELETE_UNREFERENCED=false  # broad orphan-media sweep; opt in carefully
+THUMBNAIL_CLEANUP=true           # remove thumbnails whose original is gone
+
+# ---------------------------------------------------------------------------
+# Cache, temp and logs
+# ---------------------------------------------------------------------------
+CACHE_DIRS="wp-content/cache wp-content/et-cache wp-content/uploads/cache wp-content/wphb-cache wp-content/litespeed"
+CACHE_MAX_AGE_DAYS=7
+LOG_MAX_AGE_DAYS=14
+TEMP_GLOBS="*.tmp *.temp *.swp *~ .DS_Store Thumbs.db"
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+DB_BACKUP_ENABLED=true
+BACKUP_DIR="/var/backups/wp-maintenance"
+BACKUP_RETENTION_DAYS=14
+KEEP_REVISIONS=3
+TRASH_MAX_AGE_DAYS=30
+DB_OPTIMIZE=true
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+LOG_DIR="/var/log/wp-maintenance"
+STATE_DIR="/var/lib/wp-maintenance"

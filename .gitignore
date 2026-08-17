@@ -1,0 +1,3 @@
+config/maintenance.conf
+var/
+*.log
