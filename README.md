@@ -42,6 +42,16 @@ Monitor -> Detect -> Optimize -> Remove temp data -> Remove orphaned data
 | 39–40 GB | `HARD_CLEAN` | aggressive removal of eligible content |
 | ≥ 40 GB | `EMERGENCY` | emergency cleanup, repeated until under the ceiling |
 
+## Two ways to deploy
+
+- **With SSH**: the shell suite below (`install/install.sh`), driven by system cron.
+- **Without SSH** (cPanel/managed WordPress): the single-file plugin
+  `wordpress-plugin/afimex-nightly-maintenance.php`, uploaded through wp-admin.
+  It self-schedules at 4:00 AM site time via WP-Cron, surveys post types and
+  date meta keys on its own settings page, and enforces the same safety gates
+  (dry-run default, auction-date retention, refuse-on-ambiguity). See
+  `wordpress-plugin/INSTALL.md` — the rest of this README covers the shell suite.
+
 ## Install
 
 Run **on the webserver**, not from a workstation:
