@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Afimex Nightly Maintenance
  * Description: Nightly 4:00 AM maintenance: storage audit against a 40 GB ceiling, auction-date-based vehicle retention, database cleanup, and a persistent maintenance log. DRY RUN by default — deletes nothing until explicitly enabled.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: Site Maintenance
  * License: GPL-2.0-or-later
  *
@@ -70,6 +70,7 @@ final class Afimex_Nightly_Maintenance {
 			'keep_revisions'        => 3,
 			'trash_max_age_days'    => 30,
 			'delete_vehicle_media'  => 1,   // remove images of deleted vehicles when unreferenced
+			'clean_ewww_backups'    => 1,   // prune EWWW pre-optimization image backups
 			'purge_batch'           => 50,  // vehicles per batch before recheck
 			'max_runtime_seconds'   => 600, // stop cleanly before PHP/host limits kill us
 		);
@@ -468,6 +469,14 @@ final class Afimex_Nightly_Maintenance {
 		$this->log( 'INFO', '--- Cache / temp file cleanup ---' );
 		$content = untrailingslashit( WP_CONTENT_DIR );
 		$targets = array( $content . '/cache', $content . '/et-cache', $content . '/litespeed', $content . '/wphb-cache' );
+		if ( ! empty( $s['clean_ewww_backups'] ) ) {
+			// EWWW Image Optimizer's pre-optimization originals. They exist only
+			// so an optimization can be undone — the images the site serves are
+			// in uploads/, so pruning these does not affect the live site. EWWW
+			// itself expires them after 30 days; we prune at the same 7-day age
+			// as the cache dirs.
+			$targets[] = $content . '/ewww/image-backup';
+		}
 		$cutoff  = time() - 7 * DAY_IN_SECONDS;
 
 		foreach ( $targets as $dir ) {
@@ -815,6 +824,7 @@ final class Afimex_Nightly_Maintenance {
 		$s['threshold_aggressive'] = max( 1, (int) ( $in['threshold_aggressive'] ?? 35 ) );
 		$s['threshold_remove_old'] = max( 1, (int) ( $in['threshold_remove_old'] ?? 38 ) );
 		$s['delete_vehicle_media'] = empty( $in['delete_vehicle_media'] ) ? 0 : 1;
+		$s['clean_ewww_backups']   = empty( $in['clean_ewww_backups'] ) ? 0 : 1;
 		update_option( self::OPT_SETTINGS, $s, false );
 		wp_safe_redirect( admin_url( 'tools.php?page=anm-maintenance&saved=1' ) );
 		exit;
@@ -936,6 +946,7 @@ final class Afimex_Nightly_Maintenance {
 					<tr><th>Aggressive at (GB)</th><td><input name="threshold_aggressive" type="number" min="1" value="<?php echo (int) $s['threshold_aggressive']; ?>" style="width:80px"></td></tr>
 					<tr><th>Remove old at (GB)</th><td><input name="threshold_remove_old" type="number" min="1" value="<?php echo (int) $s['threshold_remove_old']; ?>" style="width:80px"></td></tr>
 					<tr><th>Delete vehicle media</th><td><label><input type="checkbox" name="delete_vehicle_media" <?php checked( $s['delete_vehicle_media'] ); ?>> Remove a deleted vehicle's images when nothing else references them</label></td></tr>
+				<tr><th>Prune EWWW backups</th><td><label><input type="checkbox" name="clean_ewww_backups" <?php checked( $s['clean_ewww_backups'] ); ?>> Delete EWWW pre-optimization image backups older than 7 days (wp-content/ewww/image-backup — safe: the served images live in uploads/)</label></td></tr>
 					<tr>
 						<th>Execute mode</th>
 						<td>
