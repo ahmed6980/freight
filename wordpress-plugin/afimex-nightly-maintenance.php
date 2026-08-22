@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Afimex Nightly Maintenance
  * Description: Nightly 4:00 AM maintenance: storage audit against a 40 GB ceiling, auction-date-based vehicle retention, database cleanup, and a persistent maintenance log. DRY RUN by default — deletes nothing until explicitly enabled.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Site Maintenance
  * License: GPL-2.0-or-later
  *
@@ -158,27 +158,6 @@ final class Afimex_Nightly_Maintenance {
 	/* Storage measurement                                                 */
 	/* ------------------------------------------------------------------ */
 
-	private function dir_bytes( $path ) {
-		$bytes = 0;
-		if ( ! is_dir( $path ) ) {
-			return 0;
-		}
-		try {
-			$it = new RecursiveIteratorIterator(
-				new RecursiveDirectoryIterator( $path, FilesystemIterator::SKIP_DOTS ),
-				RecursiveIteratorIterator::LEAVES_ONLY,
-				RecursiveIteratorIterator::CATCH_GET_CHILD // skip unreadable dirs
-			);
-			foreach ( $it as $file ) {
-				if ( $file->isFile() ) {
-					$bytes += $file->getSize();
-				}
-			}
-		} catch ( Exception $e ) {
-			$this->log( 'WARN', 'Size scan issue under ' . $path . ': ' . $e->getMessage() );
-		}
-		return $bytes;
-	}
 
 	private function db_bytes() {
 		global $wpdb;
@@ -189,14 +168,51 @@ final class Afimex_Nightly_Maintenance {
 		return (int) $size;
 	}
 
-	/** Total site footprint: document root + database. */
+	/** Largest directories from the most recent measure_storage() walk. */
+	private $breakdown = array();
+
+	/**
+	 * Total site footprint: document root + database. The same walk also
+	 * aggregates bytes per directory (3 levels deep) so the report can show
+	 * WHERE the space is — essential when deciding what to free.
+	 */
 	private function measure_storage() {
-		$files = $this->dir_bytes( untrailingslashit( ABSPATH ) );
-		$db    = $this->db_bytes();
+		$root    = untrailingslashit( ABSPATH );
+		$total   = 0;
+		$dirs    = array();
+		$rootlen = strlen( $root ) + 1;
+		if ( is_dir( $root ) ) {
+			try {
+				$it = new RecursiveIteratorIterator(
+					new RecursiveDirectoryIterator( $root, FilesystemIterator::SKIP_DOTS ),
+					RecursiveIteratorIterator::LEAVES_ONLY,
+					RecursiveIteratorIterator::CATCH_GET_CHILD
+				);
+				foreach ( $it as $file ) {
+					if ( ! $file->isFile() ) {
+						continue;
+					}
+					$sz     = $file->getSize();
+					$total += $sz;
+					$rel    = str_replace( '\\', '/', substr( $file->getPath(), $rootlen ) );
+					$parts  = ( '' === $rel ) ? array( '(root)' ) : explode( '/', $rel );
+					$key    = implode( '/', array_slice( $parts, 0, 3 ) );
+					$dirs[ $key ] = ( isset( $dirs[ $key ] ) ? $dirs[ $key ] : 0 ) + $sz;
+				}
+			} catch ( Exception $e ) {
+				$this->log( 'WARN', 'Size scan issue: ' . $e->getMessage() );
+			}
+		}
+		arsort( $dirs );
+		// Keep entries of 50 MB and up; cap the list.
+		$this->breakdown = array_slice( array_filter( $dirs, function ( $b ) {
+			return $b >= 50 * 1024 * 1024;
+		} ), 0, 15, true );
+		$db = $this->db_bytes();
 		return array(
-			'files' => $files,
+			'files' => $total,
 			'db'    => $db,
-			'total' => $files + $db,
+			'total' => $total + $db,
 		);
 	}
 
@@ -262,6 +278,10 @@ final class Afimex_Nightly_Maintenance {
 			if ( 'EMERGENCY' === $tier ) {
 				$this->log( 'WARN', 'AT OR ABOVE THE CEILING — emergency cleanup mode.' );
 			}
+			$this->log( 'INFO', 'Largest directories (relative to the WordPress root):' );
+			foreach ( $this->breakdown as $bd_dir => $bd_bytes ) {
+				$this->log( 'INFO', sprintf( '  %7.2f GB  %s', $bd_bytes / ( 1024 * 1024 * 1024 ), $bd_dir ) );
+			}
 
 			// --- Priority 1: transients, revisions, drafts, trash, spam ---
 			$this->cleanup_database( $s );
@@ -306,6 +326,9 @@ final class Afimex_Nightly_Maintenance {
 				'counts'          => $this->counts,
 				'health_ok'       => $health,
 				'duration_s'      => time() - $started,
+				'breakdown'       => array_map( function ( $b ) {
+					return round( $b / ( 1024 * 1024 * 1024 ), 2 );
+				}, $this->breakdown ),
 				'log'             => array_slice( $this->log, -400 ),
 			);
 			update_option( self::OPT_REPORT, $report, false );
@@ -861,6 +884,17 @@ final class Afimex_Nightly_Maintenance {
 					<tr><td>Health</td><td><?php echo $report['health_ok'] ? 'PASSED' : '<strong style="color:#d63638">FAILED</strong>'; ?></td></tr>
 				</tbody>
 			</table>
+			<?php if ( ! empty( $report['breakdown'] ) ) : ?>
+			<h3>Where the space is</h3>
+			<table class="widefat striped" style="max-width:560px">
+				<thead><tr><th>Directory</th><th style="width:110px">Size</th></tr></thead>
+				<tbody>
+				<?php foreach ( $report['breakdown'] as $bd_dir => $bd_gb ) : ?>
+					<tr><td><code><?php echo esc_html( $bd_dir ); ?></code></td><td><?php echo esc_html( $bd_gb ); ?> GB</td></tr>
+				<?php endforeach; ?>
+				</tbody>
+			</table>
+			<?php endif; ?>
 			<details style="margin-top:8px;max-width:760px"><summary>Run log (last <?php echo count( $report['log'] ); ?> lines)</summary>
 				<pre style="background:#fff;border:1px solid #ccd0d4;padding:8px;overflow:auto;max-height:420px"><?php echo esc_html( implode( "\n", $report['log'] ) ); ?></pre>
 			</details>
