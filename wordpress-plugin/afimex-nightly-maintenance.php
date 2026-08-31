@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Afimex Nightly Maintenance
- * Description: Nightly 4:00 AM maintenance: storage audit against a 40 GB ceiling, auction-date-based vehicle retention, database cleanup, and a persistent maintenance log. DRY RUN by default — deletes nothing until explicitly enabled.
- * Version: 1.3.0
+ * Description: Nightly 4:00 AM maintenance: storage audit against a 30 GB ceiling, auction-date-based vehicle retention, database cleanup, a nightly email report (storage, health, SEO), and a persistent maintenance log. DRY RUN by default — deletes nothing until explicitly enabled.
+ * Version: 2.0.0
  * Author: Site Maintenance
  * License: GPL-2.0-or-later
  *
@@ -22,6 +22,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 final class Afimex_Nightly_Maintenance {
 
+	const VERSION     = '2.0.0';
+	const OPT_VERSION = 'anm_version';
 	const CRON_HOOK   = 'anm_nightly_maintenance';
 	const OPT_SETTINGS = 'anm_settings';
 	const OPT_REPORT   = 'anm_last_report';
@@ -54,6 +56,8 @@ final class Afimex_Nightly_Maintenance {
 		add_action( 'admin_menu', array( $this, 'admin_menu' ) );
 		add_action( 'admin_post_anm_save_settings', array( $this, 'handle_save_settings' ) );
 		add_action( 'admin_post_anm_run_now', array( $this, 'handle_run_now' ) );
+		add_action( 'admin_post_anm_send_test_email', array( $this, 'handle_send_test_email' ) );
+		add_action( 'plugins_loaded', array( $this, 'maybe_upgrade' ) );
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -66,13 +70,13 @@ final class Afimex_Nightly_Maintenance {
 			'vehicle_post_type'     => '',  // must be set before any vehicle purge
 			'auction_date_meta'     => '',  // must be set before any vehicle purge
 			'retention_days'        => 7,
-			'storage_limit_gb'      => 40,
-			'threshold_aggressive'  => 35,
-			'threshold_remove_old'  => 38,
+			'storage_limit_gb'      => 30,  // hard ceiling; tiers derive from it
 			'keep_revisions'        => 3,
 			'trash_max_age_days'    => 30,
 			'delete_vehicle_media'  => 1,   // remove images of deleted vehicles when unreferenced
 			'clean_ewww_backups'    => 1,   // prune EWWW pre-optimization image backups
+			'email_enabled'         => 1,   // nightly report email after every run
+			'email_to'              => 'ahmedould@gmail.com', // falls back to admin_email if emptied/invalid
 			'purge_batch'           => 50,  // vehicles per batch before recheck
 			'max_runtime_seconds'   => 600, // stop cleanly before PHP/host limits kill us
 		);
@@ -80,6 +84,34 @@ final class Afimex_Nightly_Maintenance {
 
 	public static function settings() {
 		return wp_parse_args( (array) get_option( self::OPT_SETTINGS, array() ), self::defaults() );
+	}
+
+	/**
+	 * Pure settings migration (no WordPress calls, unit-testable).
+	 * v2.0.0: the ceiling drops to 30 GB and the two tier thresholds become
+	 * derived from the limit, so their stored values are removed.
+	 */
+	public static function migrate_settings( array $stored ) {
+		if ( isset( $stored['storage_limit_gb'] ) ) {
+			$stored['storage_limit_gb'] = min( max( 5, (int) $stored['storage_limit_gb'] ), 30 );
+		}
+		unset( $stored['threshold_aggressive'], $stored['threshold_remove_old'] );
+		return $stored;
+	}
+
+	/** One-time upgrade of stored settings, keyed on the stored version. */
+	public function maybe_upgrade() {
+		$stored_version = (string) get_option( self::OPT_VERSION, '' );
+		if ( version_compare( $stored_version, self::VERSION, '>=' ) ) {
+			return;
+		}
+		$raw      = (array) get_option( self::OPT_SETTINGS, array() );
+		$migrated = self::migrate_settings( $raw );
+		if ( $migrated !== $raw ) {
+			update_option( self::OPT_SETTINGS, $migrated, false );
+		}
+		// Autoload yes on purpose: this option is read on every request.
+		update_option( self::OPT_VERSION, self::VERSION );
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -234,12 +266,14 @@ final class Afimex_Nightly_Maintenance {
 		return round( $bytes / ( 1024 * 1024 * 1024 ), 2 );
 	}
 
-	private function storage_tier( $total_bytes, $s ) {
-		$gb = $total_bytes / ( 1024 * 1024 * 1024 );
-		if ( $gb >= $s['storage_limit_gb'] )      return 'EMERGENCY';
-		if ( $gb >= $s['storage_limit_gb'] - 1 )  return 'HARD_CLEAN';
-		if ( $gb >= $s['threshold_remove_old'] )  return 'REMOVE_OLD';
-		if ( $gb >= $s['threshold_aggressive'] )  return 'AGGRESSIVE';
+	/** Tiers derive from the single ceiling: limit-5 / limit-2 / limit-1. */
+	public static function storage_tier( $total_bytes, $s ) {
+		$gb    = $total_bytes / ( 1024 * 1024 * 1024 );
+		$limit = max( 5, (int) $s['storage_limit_gb'] );
+		if ( $gb >= $limit )      return 'EMERGENCY';
+		if ( $gb >= $limit - 1 )  return 'HARD_CLEAN';
+		if ( $gb >= $limit - 2 )  return 'REMOVE_OLD';
+		if ( $gb >= $limit - 5 )  return 'AGGRESSIVE';
 		return 'NORMAL';
 	}
 
@@ -320,7 +354,7 @@ final class Afimex_Nightly_Maintenance {
 		}
 		$this->release_lock();
 		$report = wp_parse_args( (array) get_option( self::OPT_REPORT, array() ), array(
-			'storage_before' => '?', 'storage_after' => '?', 'storage_limit' => 40,
+			'storage_before' => '?', 'storage_after' => '?', 'storage_limit' => 30,
 			'tier' => 'UNKNOWN', 'reclaimed_gb' => 0, 'health_ok' => false, 'duration_s' => 0,
 		) );
 		$report['status'] = 'ABORTED';
@@ -330,6 +364,16 @@ final class Afimex_Nightly_Maintenance {
 		$this->log[]      = '[shutdown] Run aborted mid-flight (fatal error or PHP time limit). Lock released.';
 		$report['log']    = array_slice( $this->log, -400 );
 		update_option( self::OPT_REPORT, $report, false );
+
+		// Keep the history honest: an aborted night must show up there too.
+		$history   = (array) get_option( self::OPT_HISTORY, array() );
+		$history[] = array(
+			'time'     => $report['time'], 'status' => 'ABORTED', 'mode' => $report['mode'],
+			'before'   => $report['storage_before'], 'after' => $report['storage_after'],
+			'vehicles' => isset( $this->counts['vehicles_deleted'] ) ? (int) $this->counts['vehicles_deleted'] : 0,
+			'errors'   => isset( $this->counts['errors'] ) ? (int) $this->counts['errors'] : 0,
+		);
+		update_option( self::OPT_HISTORY, array_slice( $history, -60 ), false );
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -345,8 +389,10 @@ final class Afimex_Nightly_Maintenance {
 			'images_deleted' => 0, 'errors' => 0, 'vehicles_eligible' => 0,
 		);
 		$this->bytes_reclaimed = 0;
-		$started = time();
+		$started  = time();
 		$deadline = $started + max( 60, (int) $s['max_runtime_seconds'] );
+		// Captured before this run overwrites it — used to flag ABORTED nights.
+		$prev_report = (array) get_option( self::OPT_REPORT, array() );
 
 		// --- Guard 1: no concurrent runs. ---------------------------------
 		if ( ! $this->acquire_lock() ) {
@@ -417,16 +463,30 @@ final class Afimex_Nightly_Maintenance {
 			}
 
 			// --- Verify --------------------------------------------------
-			$health = $this->verify_site( $s );
+			$health    = $this->verify_site( $s );
+			$health_ok = ! empty( $health['ok'] );
+
+			// --- SEO audit (must never break the run) --------------------
+			$seo = array();
+			try {
+				$seo = $this->seo_checks( $s, $health );
+			} catch ( Throwable $e ) {
+				$this->log( 'WARN', 'SEO checks failed: ' . $e->getMessage() );
+			}
 
 			// --- Report --------------------------------------------------
 			$status = 'HEALTHY';
 			if ( 'NORMAL' !== $tier_after || $this->counts['errors'] > 0 ) {
 				$status = 'WARNING';
 			}
-			if ( 'EMERGENCY' === $tier_after || ! $health ) {
+			if ( 'EMERGENCY' === $tier_after || ! $health_ok ) {
 				$status = 'CRITICAL';
 			}
+
+			// The homepage body is only needed in-memory for the SEO checks;
+			// never persist up to 256 KB of HTML into the options table.
+			$health_persist = $health;
+			unset( $health_persist['homepage_body'] );
 
 			$report = array(
 				'time'            => wp_date( 'Y-m-d H:i:s T' ),
@@ -438,14 +498,16 @@ final class Afimex_Nightly_Maintenance {
 				'tier'            => $tier_after,
 				'reclaimed_gb'    => self::gb( $this->bytes_reclaimed ),
 				'counts'          => $this->counts,
-				'health_ok'       => $health,
+				'health_ok'       => $health_ok,
+				'health'          => $health_persist,
+				'seo'             => $seo,
+				'partial'         => ! empty( $before['partial'] ) || ! empty( $after['partial'] ),
 				'duration_s'      => time() - $started,
 				'breakdown'       => array_map( function ( $b ) {
 					return round( $b / ( 1024 * 1024 * 1024 ), 2 );
 				}, $this->breakdown ),
 				'log'             => array_slice( $this->log, -400 ),
 			);
-			update_option( self::OPT_REPORT, $report, false );
 
 			$history   = (array) get_option( self::OPT_HISTORY, array() );
 			$history[] = array(
@@ -453,12 +515,21 @@ final class Afimex_Nightly_Maintenance {
 				'before' => $report['storage_before'], 'after' => $report['storage_after'],
 				'vehicles' => $this->counts['vehicles_deleted'], 'errors' => $this->counts['errors'],
 			);
-			update_option( self::OPT_HISTORY, array_slice( $history, -60 ), false );
+			$history = array_slice( $history, -60 );
+			update_option( self::OPT_HISTORY, $history, false );
+
+			$report['notices'] = $this->important_notices( $s, $report, $history, $prev_report );
+			$report['log']     = array_slice( $this->log, -400 );
+			update_option( self::OPT_REPORT, $report, false );
 
 			if ( ! $this->dry_run ) {
 				update_option( self::OPT_CYCLE, $cycle, false );
 			}
 			$this->log( 'INFO', "STATUS: {$status}" );
+
+			// Email goes out last: the run's results are already persisted,
+			// so a mail failure can never cost a night of cleanup.
+			$this->send_report_email( $s, $report );
 		} finally {
 			$this->run_completed = true;
 			$this->release_lock();
@@ -972,13 +1043,19 @@ final class Afimex_Nightly_Maintenance {
 
 	private function verify_site( $s ) {
 		$this->log( 'INFO', '--- Verification ---' );
-		$ok = true;
+		$ok            = true;
+		$db_ok         = true;
+		$homepage_code = 0;
+		$homepage_body = '';
+		$archive_code  = null;
+		$cron_ok       = true;
 
 		// Database reachable?
 		global $wpdb;
 		if ( null === $wpdb->get_var( 'SELECT 1' ) ) {
 			$this->log( 'ERROR', 'Database check failed.' );
-			$ok = false;
+			$ok    = false;
+			$db_ok = false;
 		}
 
 		// Homepage responds? (loopback request)
@@ -987,11 +1064,13 @@ final class Afimex_Nightly_Maintenance {
 			$this->log( 'ERROR', 'Homepage check failed: ' . $resp->get_error_message() );
 			$ok = false;
 		} else {
-			$code = wp_remote_retrieve_response_code( $resp );
-			$this->log( 'INFO', "Homepage: HTTP {$code}" );
-			if ( $code >= 400 ) {
+			$homepage_code = (int) wp_remote_retrieve_response_code( $resp );
+			// Kept (capped) for the SEO checks so they need no second request.
+			$homepage_body = substr( (string) wp_remote_retrieve_body( $resp ), 0, 262144 );
+			$this->log( 'INFO', "Homepage: HTTP {$homepage_code}" );
+			if ( $homepage_code >= 400 ) {
 				$ok = false;
-				$this->log( 'ERROR', "Homepage returned HTTP {$code}." );
+				$this->log( 'ERROR', "Homepage returned HTTP {$homepage_code}." );
 			}
 		}
 
@@ -1000,10 +1079,10 @@ final class Afimex_Nightly_Maintenance {
 		if ( $ptype && post_type_exists( $ptype ) ) {
 			$archive = get_post_type_archive_link( $ptype );
 			if ( $archive ) {
-				$resp = wp_remote_get( $archive, array( 'timeout' => 20, 'sslverify' => false ) );
-				$code = is_wp_error( $resp ) ? 0 : wp_remote_retrieve_response_code( $resp );
-				$this->log( 'INFO', "Vehicle archive: HTTP {$code} ({$archive})" );
-				if ( $code >= 400 || 0 === $code ) {
+				$resp         = wp_remote_get( $archive, array( 'timeout' => 20, 'sslverify' => false ) );
+				$archive_code = is_wp_error( $resp ) ? 0 : (int) wp_remote_retrieve_response_code( $resp );
+				$this->log( 'INFO', "Vehicle archive: HTTP {$archive_code} ({$archive})" );
+				if ( $archive_code >= 400 || 0 === $archive_code ) {
 					$ok = false;
 					$this->log( 'ERROR', 'Vehicle archive check failed.' );
 				}
@@ -1013,9 +1092,446 @@ final class Afimex_Nightly_Maintenance {
 		// Our own cron still scheduled?
 		if ( ! wp_next_scheduled( self::CRON_HOOK ) ) {
 			$this->schedule();
+			$cron_ok = false;
 			$this->log( 'WARN', 'Cron event was missing — rescheduled.' );
 		}
-		return $ok;
+
+		return array(
+			'ok'            => $ok,
+			'db_ok'         => $db_ok,
+			'homepage_code' => $homepage_code,
+			'homepage_body' => $homepage_body,
+			'archive_code'  => $archive_code,
+			'cron_ok'       => $cron_ok,
+		);
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* SEO checks                                                          */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Parse the SEO-relevant bits out of homepage HTML. Pure (no WordPress
+	 * calls), regex-based on purpose: tolerant of broken markup, no libxml
+	 * dependency, and directly unit-testable.
+	 */
+	public static function seo_parse_homepage( $html ) {
+		$out  = array(
+			'title' => null, 'title_len' => 0,
+			'meta_description' => null, 'desc_len' => 0,
+			'canonical' => null, 'noindex' => false,
+		);
+		$html = (string) $html;
+		if ( '' === $html ) {
+			return $out;
+		}
+		if ( preg_match( '~<title[^>]*>(.*?)</title>~is', $html, $m ) ) {
+			$out['title']     = trim( html_entity_decode( $m[1] ) );
+			$out['title_len'] = strlen( $out['title'] );
+		}
+		if ( preg_match_all( '~<meta\b[^>]*>~i', $html, $tags ) ) {
+			foreach ( $tags[0] as $tag ) {
+				$name    = '';
+				$content = '';
+				if ( preg_match( '~name\s*=\s*["\']([^"\']+)["\']~i', $tag, $nm ) ) {
+					$name = strtolower( $nm[1] );
+				}
+				if ( preg_match( '~content\s*=\s*["\']([^"\']*)["\']~i', $tag, $cm ) ) {
+					$content = $cm[1];
+				}
+				if ( 'description' === $name && null === $out['meta_description'] ) {
+					$out['meta_description'] = trim( html_entity_decode( $content ) );
+					$out['desc_len']         = strlen( $out['meta_description'] );
+				}
+				if ( 'robots' === $name && false !== stripos( $content, 'noindex' ) ) {
+					$out['noindex'] = true;
+				}
+			}
+		}
+		if ( preg_match( '~<link\b[^>]*rel\s*=\s*["\']canonical["\'][^>]*>~i', $html, $lm )
+			&& preg_match( '~href\s*=\s*["\']([^"\']+)["\']~i', $lm[0], $hm ) ) {
+			$out['canonical'] = $hm[1];
+		}
+		return $out;
+	}
+
+	/**
+	 * Nightly SEO audit. Everything here is in-WordPress: options, the
+	 * homepage HTML the health check already fetched, and two bounded
+	 * loopback probes. Rankings, backlinks, PageSpeed, and crawl coverage
+	 * are deliberately excluded — they require external APIs, and nothing
+	 * in this plugin may depend on a third-party service.
+	 * Returns rows of array( 'label', 'ok' (bool|null=informational), 'detail' ).
+	 */
+	private function seo_checks( $s, array $health ) {
+		$rows = array();
+
+		$blog_public = (string) get_option( 'blog_public' );
+		$rows[] = array(
+			'label'  => 'Search engine visibility',
+			'ok'     => '0' !== $blog_public,
+			'detail' => '0' === $blog_public ? '"Discourage search engines" is ENABLED in Settings > Reading' : 'indexing allowed',
+		);
+
+		$permalinks = (string) get_option( 'permalink_structure' );
+		$rows[] = array(
+			'label'  => 'Permalink structure',
+			'ok'     => '' !== $permalinks,
+			'detail' => '' === $permalinks ? 'plain (?p=123) permalinks — bad for SEO' : $permalinks,
+		);
+
+		$yoast = defined( 'WPSEO_VERSION' );
+		$rank  = defined( 'RANK_MATH_VERSION' ) || class_exists( 'RankMath' );
+		$rows[] = array(
+			'label'  => 'SEO plugin',
+			'ok'     => ( $yoast || $rank ) ? true : null,
+			'detail' => $yoast ? 'Yoast SEO active' : ( $rank ? 'Rank Math active' : 'none detected' ),
+		);
+
+		$body = isset( $health['homepage_body'] ) ? $health['homepage_body'] : '';
+		if ( '' !== $body ) {
+			$hp = self::seo_parse_homepage( $body );
+			$rows[] = array(
+				'label'  => 'Homepage title',
+				'ok'     => null !== $hp['title'] && $hp['title_len'] >= 10 && $hp['title_len'] <= 70,
+				'detail' => null === $hp['title'] ? 'missing <title>' : $hp['title_len'] . ' chars (10-70 recommended): ' . $hp['title'],
+			);
+			$rows[] = array(
+				'label'  => 'Homepage meta description',
+				'ok'     => null !== $hp['meta_description'] && $hp['desc_len'] >= 50 && $hp['desc_len'] <= 160,
+				'detail' => null === $hp['meta_description'] ? 'missing' : $hp['desc_len'] . ' chars (50-160 recommended)',
+			);
+			$rows[] = array(
+				'label'  => 'Canonical link',
+				'ok'     => null !== $hp['canonical'],
+				'detail' => null === $hp['canonical'] ? 'no rel=canonical on homepage' : $hp['canonical'],
+			);
+			$rows[] = array(
+				'label'  => 'Homepage indexable',
+				'ok'     => ! $hp['noindex'],
+				'detail' => $hp['noindex'] ? 'homepage carries a NOINDEX robots meta tag!' : 'no noindex directive',
+			);
+		} else {
+			$rows[] = array( 'label' => 'Homepage HTML checks', 'ok' => null, 'detail' => 'homepage was not fetched this run' );
+		}
+
+		$resp = wp_remote_get( home_url( '/robots.txt' ), array( 'timeout' => 10, 'sslverify' => false ) );
+		$code = is_wp_error( $resp ) ? 0 : (int) wp_remote_retrieve_response_code( $resp );
+		$rb   = is_wp_error( $resp ) ? '' : (string) wp_remote_retrieve_body( $resp );
+		$blocked = ( 200 === $code && preg_match( '~^Disallow:\s*/\s*$~mi', $rb ) );
+		$rows[] = array(
+			'label'  => 'robots.txt',
+			'ok'     => 200 === $code && ! $blocked,
+			'detail' => 200 !== $code ? 'HTTP ' . $code : ( $blocked ? 'contains a blanket "Disallow: /" (heuristic — review it)' : 'reachable' ),
+		);
+
+		$sitemap = '';
+		foreach ( array( 'sitemap_index.xml', 'sitemap.xml', 'wp-sitemap.xml' ) as $cand ) {
+			$r = wp_remote_head( home_url( '/' . $cand ), array( 'timeout' => 10, 'sslverify' => false ) );
+			$c = is_wp_error( $r ) ? 0 : (int) wp_remote_retrieve_response_code( $r );
+			if ( $c > 0 && $c < 400 ) {
+				$sitemap = $cand;
+				break;
+			}
+		}
+		$rows[] = array(
+			'label'  => 'XML sitemap',
+			'ok'     => '' !== $sitemap,
+			'detail' => '' !== $sitemap ? '/' . $sitemap : 'none found at the usual paths',
+		);
+
+		if ( $yoast || $rank ) {
+			global $wpdb;
+			$key     = $yoast ? '_yoast_wpseo_metadesc' : 'rank_math_description';
+			$missing = (int) $wpdb->get_var( $wpdb->prepare(
+				"SELECT COUNT(*) FROM {$wpdb->posts} p
+				 LEFT JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = %s AND pm.meta_value <> ''
+				 WHERE p.post_status = 'publish' AND p.post_type IN ('post','page') AND pm.post_id IS NULL",
+				$key
+			) );
+			// Posts and pages only: vehicles are transient inventory and would
+			// swamp the count with noise.
+			$rows[] = array(
+				'label'  => 'Meta descriptions (posts/pages)',
+				'ok'     => null,
+				'detail' => $missing . ' published post(s)/page(s) missing a meta description',
+			);
+		}
+
+		foreach ( $rows as $r ) {
+			$mark = ( null === $r['ok'] ) ? 'info' : ( $r['ok'] ? 'OK' : 'FAIL' );
+			$this->log( 'INFO', "SEO [{$mark}] {$r['label']}: {$r['detail']}" );
+		}
+		return $rows;
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Growth projection + important notices                               */
+	/* ------------------------------------------------------------------ */
+
+	/**
+	 * Average day-over-day storage delta from run history (one entry per
+	 * night). Pure static, unit-testable. days_to_ceiling is null when there
+	 * are fewer than 3 data points or the site is not growing.
+	 */
+	public static function growth_projection( array $history, $limit_gb ) {
+		$vals = array();
+		foreach ( $history as $h ) {
+			if ( isset( $h['after'] ) && is_numeric( $h['after'] ) ) {
+				$vals[] = (float) $h['after'];
+			}
+		}
+		$vals = array_slice( $vals, -8 );
+		$n    = count( $vals );
+		$out  = array(
+			'rate_gb_day'     => 0.0,
+			'current_gb'      => $n ? $vals[ $n - 1 ] : 0.0,
+			'days_to_ceiling' => null,
+		);
+		if ( $n < 3 ) {
+			return $out;
+		}
+		$deltas = array();
+		for ( $i = 1; $i < $n; $i++ ) {
+			$deltas[] = $vals[ $i ] - $vals[ $i - 1 ];
+		}
+		$rate               = array_sum( $deltas ) / count( $deltas );
+		$out['rate_gb_day'] = round( $rate, 3 );
+		if ( $rate > 0.001 ) {
+			$out['days_to_ceiling'] = round( ( (float) $limit_gb - $out['current_gb'] ) / $rate, 1 );
+		}
+		return $out;
+	}
+
+	/** The "important information" section: anomalies worth waking up for. */
+	private function important_notices( $s, array $report, array $history, array $prev_report ) {
+		$notices = array();
+
+		if ( 'EMERGENCY' === $report['tier'] ) {
+			$notices[] = array( 'severity' => 'critical', 'text' => 'Storage is AT OR ABOVE the ' . $report['storage_limit'] . ' GB ceiling after cleanup. Eligible content is exhausted or the purge is misconfigured — review now.' );
+		}
+
+		$proj = self::growth_projection( $history, $report['storage_limit'] );
+		if ( null !== $proj['days_to_ceiling'] && $proj['days_to_ceiling'] < 7 ) {
+			$notices[] = array( 'severity' => 'critical', 'text' => sprintf( 'Growth anomaly: averaging +%.2f GB/day — the %d GB ceiling is ~%.1f days away at this rate. Identify the growth source.', $proj['rate_gb_day'], $report['storage_limit'], $proj['days_to_ceiling'] ) );
+		}
+		$hn = count( $history );
+		if ( $hn >= 2 && isset( $history[ $hn - 1 ]['after'], $history[ $hn - 2 ]['after'] )
+			&& is_numeric( $history[ $hn - 1 ]['after'] ) && is_numeric( $history[ $hn - 2 ]['after'] )
+			&& ( (float) $history[ $hn - 1 ]['after'] - (float) $history[ $hn - 2 ]['after'] ) > 2 ) {
+			$notices[] = array( 'severity' => 'warning', 'text' => sprintf( 'Single-night jump of +%.2f GB since the previous run.', (float) $history[ $hn - 1 ]['after'] - (float) $history[ $hn - 2 ]['after'] ) );
+		}
+
+		if ( '' === $s['vehicle_post_type'] || '' === $s['auction_date_meta'] ) {
+			$notices[] = array( 'severity' => 'warning', 'text' => 'Vehicle purge is NOT configured (post type / auction-date key missing) — the largest storage lever is disabled. Configure it under Tools > Nightly Maintenance.' );
+		}
+
+		if ( 'DRY RUN' === $report['mode'] ) {
+			$notices[] = array( 'severity' => 'info', 'text' => 'This was a DRY RUN — nothing was actually deleted.' );
+		}
+
+		if ( isset( $prev_report['status'] ) && 'ABORTED' === $prev_report['status'] ) {
+			$notices[] = array( 'severity' => 'warning', 'text' => 'The PREVIOUS run aborted mid-flight (fatal error or PHP time limit). Check the log.' );
+		}
+
+		foreach ( (array) $report['breakdown'] as $dir => $gb_val ) {
+			foreach ( array( 'wp-content/ewww', 'wp-content/updraft', 'wp-content/ai1wm-backups', 'wp-content/backup' ) as $prefix ) {
+				if ( 0 === strpos( $dir, $prefix ) && (float) $gb_val >= 0.5 ) {
+					$notices[] = array( 'severity' => 'warning', 'text' => sprintf( 'Backup directory regrowing: %s is at %.2f GB. Disable the plugin feature that refills it.', $dir, (float) $gb_val ) );
+				}
+			}
+		}
+
+		if ( ! empty( $report['partial'] ) ) {
+			$notices[] = array( 'severity' => 'warning', 'text' => 'A storage walk hit the runtime budget — reported totals are a LOWER BOUND.' );
+		}
+
+		$order = array( 'critical' => 0, 'warning' => 1, 'info' => 2 );
+		usort( $notices, function ( $a, $b ) use ( $order ) {
+			return $order[ $a['severity'] ] - $order[ $b['severity'] ];
+		} );
+		return $notices;
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Nightly email report                                                */
+	/* ------------------------------------------------------------------ */
+
+	/** Pure static so tests can pin the exact subject format. */
+	public static function email_subject( array $report, $host ) {
+		return sprintf(
+			'[%s] Maintenance %s — %s/%s GB%s',
+			$host,
+			isset( $report['status'] ) ? $report['status'] : 'UNKNOWN',
+			isset( $report['storage_after'] ) ? $report['storage_after'] : '?',
+			isset( $report['storage_limit'] ) ? $report['storage_limit'] : '?',
+			( isset( $report['mode'] ) && 'DRY RUN' === $report['mode'] ) ? ' (dry run)' : ''
+		);
+	}
+
+	/**
+	 * Self-contained HTML email. Inline styles only — email clients strip
+	 * stylesheets — and esc_html() on EVERY dynamic value: log lines embed
+	 * post titles and meta values, which are user-controlled.
+	 */
+	public static function build_email_html( array $report ) {
+		$colors = array( 'HEALTHY' => '#2e7d32', 'WARNING' => '#b26a00', 'CRITICAL' => '#c62828', 'ABORTED' => '#c62828' );
+		$status = isset( $report['status'] ) ? $report['status'] : 'UNKNOWN';
+		$color  = isset( $colors[ $status ] ) ? $colors[ $status ] : '#555555';
+		$mode   = isset( $report['mode'] ) ? $report['mode'] : '';
+		$counts = isset( $report['counts'] ) && is_array( $report['counts'] ) ? $report['counts'] : array();
+		$n      = function ( $k ) use ( $counts ) {
+			return isset( $counts[ $k ] ) ? (int) $counts[ $k ] : 0;
+		};
+		$limit  = isset( $report['storage_limit'] ) ? (float) $report['storage_limit'] : 30.0;
+		$after  = isset( $report['storage_after'] ) && is_numeric( $report['storage_after'] ) ? (float) $report['storage_after'] : 0.0;
+		$pct    = $limit > 0 ? min( 100, (int) round( 100 * $after / $limit ) ) : 0;
+
+		$td  = 'padding:6px 10px;border-bottom:1px solid #eeeeee;font-size:13px;color:#333333';
+		$hd  = 'padding:12px 20px 4px;font-size:14px;font-weight:bold;color:#111111';
+
+		$h  = '<div style="font-family:Arial,Helvetica,sans-serif;background:#f4f4f4;padding:16px">';
+		$h .= '<table role="presentation" width="640" cellpadding="0" cellspacing="0" style="margin:0 auto;background:#ffffff;border:1px solid #dddddd">';
+
+		$h .= '<tr><td style="background:' . $color . ';color:#ffffff;padding:14px 20px">'
+			. '<div style="font-size:17px;font-weight:bold">Nightly Maintenance — ' . esc_html( $status ) . ( $mode ? ' — ' . esc_html( $mode ) : '' ) . '</div>'
+			. '<div style="font-size:12px;margin-top:2px">' . esc_html( isset( $report['time'] ) ? $report['time'] : '' ) . '</div>'
+			. '</td></tr>';
+
+		// --- Storage -----------------------------------------------------
+		$h .= '<tr><td style="' . $hd . '">Storage</td></tr>';
+		$h .= '<tr><td style="padding:4px 20px 0">'
+			. '<div style="font-size:22px;font-weight:bold;color:' . $color . '">' . esc_html( (string) $after ) . ' GB <span style="font-size:13px;font-weight:normal;color:#666666">of ' . esc_html( (string) $limit ) . ' GB ceiling (' . $pct . '%)</span></div>'
+			. '<div style="background:#eeeeee;width:100%;height:12px;margin:6px 0 4px"><div style="background:' . $color . ';height:12px;width:' . $pct . '%"></div></div>'
+			. '<div style="font-size:12px;color:#666666">Before: ' . esc_html( isset( $report['storage_before'] ) ? (string) $report['storage_before'] : '?' ) . ' GB'
+			. ' &nbsp;|&nbsp; Reclaimed: ' . esc_html( isset( $report['reclaimed_gb'] ) ? (string) $report['reclaimed_gb'] : '0' ) . ' GB'
+			. ' &nbsp;|&nbsp; Tier: ' . esc_html( isset( $report['tier'] ) ? $report['tier'] : '?' ) . '</div>'
+			. '</td></tr>';
+
+		if ( ! empty( $report['breakdown'] ) && is_array( $report['breakdown'] ) ) {
+			$h .= '<tr><td style="padding:8px 20px 0"><table width="100%" cellpadding="0" cellspacing="0">';
+			$h .= '<tr><td style="' . $td . ';font-weight:bold">Largest directories</td><td style="' . $td . ';font-weight:bold;text-align:right">GB</td></tr>';
+			foreach ( array_slice( $report['breakdown'], 0, 8, true ) as $dir => $gb_val ) {
+				$h .= '<tr><td style="' . $td . '"><code style="font-size:12px">' . esc_html( $dir ) . '</code></td><td style="' . $td . ';text-align:right">' . esc_html( (string) $gb_val ) . '</td></tr>';
+			}
+			$h .= '</table></td></tr>';
+		}
+
+		// --- Deletions ---------------------------------------------------
+		$h .= '<tr><td style="' . $hd . '">Cleanup</td></tr>';
+		$h .= '<tr><td style="padding:0 20px"><table width="100%" cellpadding="0" cellspacing="0"><tr>'
+			. '<td style="' . $td . '">Files: <b>' . $n( 'files_deleted' ) . '</b></td>'
+			. '<td style="' . $td . '">Pages: <b>' . $n( 'pages_deleted' ) . '</b></td>'
+			. '<td style="' . $td . '">Vehicles: <b>' . $n( 'vehicles_deleted' ) . '</b> of ' . $n( 'vehicles_eligible' ) . ' eligible</td>'
+			. '<td style="' . $td . '">Images: <b>' . $n( 'images_deleted' ) . '</b></td>'
+			. '<td style="' . $td . '">Errors: <b style="color:' . ( $n( 'errors' ) ? '#c62828' : '#2e7d32' ) . '">' . $n( 'errors' ) . '</b></td>'
+			. '</tr></table></td></tr>';
+
+		// --- Site health -------------------------------------------------
+		$health = isset( $report['health'] ) && is_array( $report['health'] ) ? $report['health'] : array();
+		$h .= '<tr><td style="' . $hd . '">Site health</td></tr>';
+		$h .= '<tr><td style="padding:0 20px"><table width="100%" cellpadding="0" cellspacing="0">';
+		$hrow = function ( $label, $ok, $detail ) use ( $td ) {
+			$mark = null === $ok ? '<span style="color:#666666">—</span>'
+				: ( $ok ? '<b style="color:#2e7d32">OK</b>' : '<b style="color:#c62828">FAIL</b>' );
+			return '<tr><td style="' . $td . ';width:220px">' . esc_html( $label ) . '</td><td style="' . $td . ';width:50px">' . $mark . '</td><td style="' . $td . '">' . esc_html( $detail ) . '</td></tr>';
+		};
+		if ( $health ) {
+			$h .= $hrow( 'Database', ! empty( $health['db_ok'] ), ! empty( $health['db_ok'] ) ? 'reachable' : 'check failed' );
+			$hc = isset( $health['homepage_code'] ) ? (int) $health['homepage_code'] : 0;
+			$h .= $hrow( 'Homepage', $hc > 0 && $hc < 400, $hc > 0 ? 'HTTP ' . $hc : 'no response' );
+			if ( isset( $health['archive_code'] ) && null !== $health['archive_code'] ) {
+				$ac = (int) $health['archive_code'];
+				$h .= $hrow( 'Vehicle listings', $ac > 0 && $ac < 400, $ac > 0 ? 'HTTP ' . $ac : 'no response' );
+			}
+			$h .= $hrow( '4:00 AM schedule', ! empty( $health['cron_ok'] ), ! empty( $health['cron_ok'] ) ? 'scheduled' : 'was missing — re-scheduled this run' );
+		} else {
+			$h .= $hrow( 'Health checks', null, 'not captured this run' );
+		}
+		$h .= '</table></td></tr>';
+
+		// --- SEO ---------------------------------------------------------
+		if ( ! empty( $report['seo'] ) && is_array( $report['seo'] ) ) {
+			$h .= '<tr><td style="' . $hd . '">SEO</td></tr>';
+			$h .= '<tr><td style="padding:0 20px"><table width="100%" cellpadding="0" cellspacing="0">';
+			foreach ( $report['seo'] as $r ) {
+				$h .= $hrow(
+					isset( $r['label'] ) ? $r['label'] : '',
+					isset( $r['ok'] ) ? $r['ok'] : null,
+					isset( $r['detail'] ) ? $r['detail'] : ''
+				);
+			}
+			$h .= '</table></td></tr>';
+		}
+
+		// --- Important information ---------------------------------------
+		if ( ! empty( $report['notices'] ) && is_array( $report['notices'] ) ) {
+			$h .= '<tr><td style="' . $hd . ';color:#c62828">IMPORTANT INFORMATION</td></tr>';
+			$h .= '<tr><td style="padding:4px 20px 8px">';
+			foreach ( $report['notices'] as $ntc ) {
+				$sev  = isset( $ntc['severity'] ) ? $ntc['severity'] : 'info';
+				$bg   = 'critical' === $sev ? '#fdecea' : ( 'warning' === $sev ? '#fff8e1' : '#eef4fb' );
+				$bd   = 'critical' === $sev ? '#c62828' : ( 'warning' === $sev ? '#b26a00' : '#1a6bb0' );
+				$h   .= '<div style="background:' . $bg . ';border-left:4px solid ' . $bd . ';padding:8px 12px;margin:4px 0;font-size:13px;color:#333333">'
+					. '<b>' . esc_html( strtoupper( $sev ) ) . ':</b> ' . esc_html( isset( $ntc['text'] ) ? $ntc['text'] : '' ) . '</div>';
+			}
+			$h .= '</td></tr>';
+		}
+
+		// --- Log tail + footer -------------------------------------------
+		if ( ! empty( $report['log'] ) && is_array( $report['log'] ) ) {
+			$h .= '<tr><td style="' . $hd . '">Log (last ' . count( array_slice( $report['log'], -40 ) ) . ' lines)</td></tr>';
+			$h .= '<tr><td style="padding:0 20px 12px"><pre style="background:#f7f7f7;border:1px solid #e0e0e0;padding:8px;font-size:11px;overflow:auto;white-space:pre-wrap;color:#444444">'
+				. esc_html( implode( "\n", array_slice( $report['log'], -40 ) ) ) . '</pre></td></tr>';
+		}
+		$h .= '<tr><td style="padding:10px 20px;background:#fafafa;border-top:1px solid #eeeeee;font-size:11px;color:#888888">'
+			. 'Afimex Nightly Maintenance v' . esc_html( self::VERSION ) . ' — manage under wp-admin &gt; Tools &gt; Nightly Maintenance</td></tr>';
+		$h .= '</table></div>';
+		return $h;
+	}
+
+	/**
+	 * Send the nightly report. Runs AFTER the report/history/cycle are
+	 * persisted and is wrapped in its own catch-all: a mail failure must
+	 * never cost a night of cleanup.
+	 */
+	private function send_report_email( $s, array $report ) {
+		if ( empty( $s['email_enabled'] ) ) {
+			$this->log( 'INFO', 'Report email disabled in settings.' );
+			return;
+		}
+		$outcome = array( 'to' => '', 'sent' => false, 'error' => '', 'time' => wp_date( 'Y-m-d H:i:s T' ) );
+		try {
+			$to            = ( isset( $s['email_to'] ) && is_email( $s['email_to'] ) ) ? $s['email_to'] : get_option( 'admin_email' );
+			$outcome['to'] = $to;
+			$host          = wp_parse_url( home_url(), PHP_URL_HOST );
+			$subject       = self::email_subject( $report, $host ? $host : 'site' );
+			$body          = self::build_email_html( $report );
+
+			// Capture the precise failure reason (wp_mail alone returns bool).
+			$mail_error = '';
+			$capture    = function ( $wp_error ) use ( &$mail_error ) {
+				$mail_error = $wp_error->get_error_message();
+			};
+			add_action( 'wp_mail_failed', $capture );
+			// No custom From header: on shared hosting a mismatched From
+			// breaks SPF and lands everything in spam.
+			$sent = wp_mail( $to, $subject, $body, array( 'Content-Type: text/html; charset=UTF-8' ) );
+			remove_action( 'wp_mail_failed', $capture );
+
+			$outcome['sent'] = (bool) $sent;
+			if ( $sent ) {
+				$this->log( 'INFO', 'Report email sent to ' . $to . '.' );
+			} else {
+				$outcome['error'] = $mail_error ? $mail_error : 'wp_mail returned false';
+				$this->log( 'ERROR', 'Report email to ' . $to . ' FAILED: ' . $outcome['error'] );
+			}
+		} catch ( Throwable $e ) {
+			$outcome['error'] = $e->getMessage();
+			$this->log( 'ERROR', 'Report email crashed: ' . $e->getMessage() );
+		}
+		$report['email'] = $outcome;
+		update_option( self::OPT_REPORT, $report, false );
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -1040,12 +1556,12 @@ final class Afimex_Nightly_Maintenance {
 		$s['vehicle_post_type']    = sanitize_key( $in['vehicle_post_type'] ?? '' );
 		$s['auction_date_meta']    = sanitize_text_field( $in['auction_date_meta'] ?? '' );
 		$s['retention_days']       = max( 1, (int) ( $in['retention_days'] ?? 7 ) );
-		$s['storage_limit_gb']     = max( 1, (int) ( $in['storage_limit_gb'] ?? 40 ) );
-		$s['threshold_aggressive'] = max( 1, (int) ( $in['threshold_aggressive'] ?? 35 ) );
-		$s['threshold_remove_old'] = max( 1, (int) ( $in['threshold_remove_old'] ?? 38 ) );
+		$s['storage_limit_gb']     = max( 5, (int) ( $in['storage_limit_gb'] ?? 30 ) );
 		$s['delete_vehicle_media'] = empty( $in['delete_vehicle_media'] ) ? 0 : 1;
 		$s['clean_ewww_backups']   = empty( $in['clean_ewww_backups'] ) ? 0 : 1;
 		$s['purge_batch']          = max( 1, (int) ( $in['purge_batch'] ?? $old['purge_batch'] ) );
+		$s['email_enabled']        = empty( $in['email_enabled'] ) ? 0 : 1;
+		$s['email_to']             = sanitize_email( $in['email_to'] ?? '' );
 
 		// A new purge target must prove itself in a dry run first, even on a
 		// site already running in execute mode: the first run after changing
@@ -1068,6 +1584,26 @@ final class Afimex_Nightly_Maintenance {
 		// Manual runs never mark the nightly cycle done and honour dry-run.
 		$this->run_maintenance( true );
 		wp_safe_redirect( admin_url( 'tools.php?page=anm-maintenance&ran=1' ) );
+		exit;
+	}
+
+	/** Re-send the last stored report so mail delivery can be debugged now. */
+	public function handle_send_test_email() {
+		if ( ! current_user_can( 'manage_options' ) || ! check_admin_referer( 'anm_send_test_email' ) ) {
+			wp_die( 'Not allowed.' );
+		}
+		$report = (array) get_option( self::OPT_REPORT, array() );
+		if ( ! $report ) {
+			wp_safe_redirect( admin_url( 'tools.php?page=anm-maintenance&mailtest=0' ) );
+			exit;
+		}
+		$this->counts = array( 'errors' => 0 ); // log() touches this
+		$s            = self::settings();
+		$s['email_enabled'] = 1; // an explicit test always tries to send
+		$this->send_report_email( $s, $report );
+		$report = (array) get_option( self::OPT_REPORT, array() );
+		$ok     = ! empty( $report['email']['sent'] );
+		wp_safe_redirect( admin_url( 'tools.php?page=anm-maintenance&mailtest=' . ( $ok ? '1' : '0' ) ) );
 		exit;
 	}
 
@@ -1106,6 +1642,7 @@ final class Afimex_Nightly_Maintenance {
 			<?php if ( ! empty( $_GET['saved'] ) ) : ?><div class="notice notice-success"><p>Settings saved.</p></div><?php endif; ?>
 			<?php if ( ! empty( $_GET['ran'] ) ) : ?><div class="notice notice-success"><p>Run finished — report below.</p></div><?php endif; ?>
 			<?php if ( ! empty( $_GET['forced_dry'] ) ) : ?><div class="notice notice-warning"><p>The vehicle purge target changed, so the plugin switched itself back to <strong>DRY RUN</strong>. Review the next dry-run report, then re-enable Execute mode.</p></div><?php endif; ?>
+			<?php if ( isset( $_GET['mailtest'] ) ) : ?><div class="notice notice-<?php echo '1' === $_GET['mailtest'] ? 'success' : 'error'; ?>"><p><?php echo '1' === $_GET['mailtest'] ? 'Test email handed to the mail system — check the inbox (and spam folder).' : 'Test email FAILED — see the "Report email" row below for the reason.'; ?></p></div><?php endif; ?>
 
 			<p>
 				<strong>Mode:</strong>
@@ -1124,6 +1661,15 @@ final class Afimex_Nightly_Maintenance {
 					<tr><td>Vehicles removed</td><td><?php echo (int) $report['counts']['vehicles_deleted']; ?> (of <?php echo (int) $report['counts']['vehicles_eligible']; ?> eligible)</td></tr>
 					<tr><td>Errors</td><td><?php echo (int) $report['counts']['errors']; ?></td></tr>
 					<tr><td>Health</td><td><?php echo $report['health_ok'] ? 'PASSED' : '<strong style="color:#d63638">FAILED</strong>'; ?></td></tr>
+					<tr><td>Report email</td><td><?php
+						if ( empty( $report['email'] ) ) {
+							echo '&mdash;';
+						} elseif ( ! empty( $report['email']['sent'] ) ) {
+							echo 'Sent to ' . esc_html( $report['email']['to'] ) . ' at ' . esc_html( $report['email']['time'] );
+						} else {
+							echo '<strong style="color:#d63638">FAILED</strong>: ' . esc_html( $report['email']['error'] ) . ' (to ' . esc_html( $report['email']['to'] ) . ')';
+						}
+					?></td></tr>
 				</tbody>
 			</table>
 			<?php if ( ! empty( $report['breakdown'] ) ) : ?>
@@ -1176,8 +1722,9 @@ final class Afimex_Nightly_Maintenance {
 					<tr><th>Retention (days)</th><td><input name="retention_days" type="number" min="1" value="<?php echo (int) $s['retention_days']; ?>" style="width:80px"> Vehicles are deleted only when the auction date is MORE than this many days old.</td></tr>
 				<tr><th>Vehicles per night (cap)</th><td><input name="purge_batch" type="number" min="1" value="<?php echo (int) $s['purge_batch']; ?>" style="width:80px"> Hard cap on vehicles permanently deleted in a single nightly run.</td></tr>
 					<tr><th>Storage ceiling (GB)</th><td><input name="storage_limit_gb" type="number" min="1" value="<?php echo (int) $s['storage_limit_gb']; ?>" style="width:80px"></td></tr>
-					<tr><th>Aggressive at (GB)</th><td><input name="threshold_aggressive" type="number" min="1" value="<?php echo (int) $s['threshold_aggressive']; ?>" style="width:80px"></td></tr>
-					<tr><th>Remove old at (GB)</th><td><input name="threshold_remove_old" type="number" min="1" value="<?php echo (int) $s['threshold_remove_old']; ?>" style="width:80px"></td></tr>
+					<tr><th>Cleanup tiers</th><td><em>Derived from the ceiling:</em> aggressive at <?php echo (int) $s['storage_limit_gb'] - 5; ?> GB, remove old content at <?php echo (int) $s['storage_limit_gb'] - 2; ?> GB, hard clean at <?php echo (int) $s['storage_limit_gb'] - 1; ?> GB, emergency at <?php echo (int) $s['storage_limit_gb']; ?> GB.</td></tr>
+					<tr><th>Nightly email report</th><td><label><input type="checkbox" name="email_enabled" <?php checked( $s['email_enabled'] ); ?>> Email the report after every run</label></td></tr>
+					<tr><th>Email recipient</th><td><input name="email_to" type="email" class="regular-text" value="<?php echo esc_attr( $s['email_to'] ); ?>" placeholder="<?php echo esc_attr( get_option( 'admin_email' ) ); ?>"> <span class="description">Blank or invalid falls back to the admin email.</span></td></tr>
 					<tr><th>Delete vehicle media</th><td><label><input type="checkbox" name="delete_vehicle_media" <?php checked( $s['delete_vehicle_media'] ); ?>> Remove a deleted vehicle's images when nothing else references them</label></td></tr>
 				<tr><th>Prune EWWW backups</th><td><label><input type="checkbox" name="clean_ewww_backups" <?php checked( $s['clean_ewww_backups'] ); ?>> Delete EWWW pre-optimization image backups older than 7 days (wp-content/ewww/image-backup — safe: the served images live in uploads/)</label></td></tr>
 					<tr>
@@ -1195,6 +1742,12 @@ final class Afimex_Nightly_Maintenance {
 				<?php wp_nonce_field( 'anm_run_now' ); ?>
 				<input type="hidden" name="action" value="anm_run_now">
 				<?php submit_button( $s['dry_run'] ? 'Run now (dry run)' : 'Run now (LIVE — will delete)', $s['dry_run'] ? 'secondary' : 'delete', 'submit', false ); ?>
+			</form>
+
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin-top:8px">
+				<?php wp_nonce_field( 'anm_send_test_email' ); ?>
+				<input type="hidden" name="action" value="anm_send_test_email">
+				<?php submit_button( 'Send test email (re-sends last report)', 'secondary', 'submit', false ); ?>
 			</form>
 		</div>
 		<?php
