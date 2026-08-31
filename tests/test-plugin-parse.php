@@ -7,6 +7,9 @@
  * Run: php tests/test-plugin-parse.php
  */
 define('ABSPATH', '/tmp/');
+define('YEAR_IN_SECONDS', 31536000);
+define('DAY_IN_SECONDS', 86400);
+define('HOUR_IN_SECONDS', 3600);
 function register_activation_hook($f, $cb) {}
 function register_deactivation_hook($f, $cb) {}
 function add_action(...$a) {}
@@ -36,6 +39,10 @@ is_eq('8-digit num preserved', $p('20260718'),             false);
 is_eq('impossible date',       $p('2026-13-45'),           false);
 is_eq('partial iso preserved', $p('2026-07'),              false);
 is_eq('sql zero preserved',    $p('0000-00-00'),           false);
+// Timestamp plausibility window: only now +/- 10 years is believable.
+is_eq('9-digit ts (2001) preserved',   $p('999999999'),   false);
+is_eq('far-future ts (2100) preserved', $p('4102444800'), false);
+is_eq('11-digit ts (2286) preserved',  $p('99999999999'), false);
 
 // Eligibility boundary: >7 days deletes, <=7 preserves (spec section 5).
 $now = strtotime('2026-08-17 04:00:00 UTC');

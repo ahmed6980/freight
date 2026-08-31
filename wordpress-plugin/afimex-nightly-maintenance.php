@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Afimex Nightly Maintenance
  * Description: Nightly 4:00 AM maintenance: storage audit against a 40 GB ceiling, auction-date-based vehicle retention, database cleanup, and a persistent maintenance log. DRY RUN by default — deletes nothing until explicitly enabled.
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: Site Maintenance
  * License: GPL-2.0-or-later
  *
@@ -36,6 +36,8 @@ final class Afimex_Nightly_Maintenance {
 	private $counts         = array();
 	private $dry_run        = true;
 	private $bytes_reclaimed = 0;
+	private $lock_token     = '';
+	private $run_completed  = true;
 
 	public static function instance() {
 		if ( null === self::$instance ) {
@@ -177,10 +179,12 @@ final class Afimex_Nightly_Maintenance {
 	 * aggregates bytes per directory (3 levels deep) so the report can show
 	 * WHERE the space is — essential when deciding what to free.
 	 */
-	private function measure_storage() {
+	private function measure_storage( $deadline = 0 ) {
 		$root    = untrailingslashit( ABSPATH );
 		$total   = 0;
 		$dirs    = array();
+		$partial = false;
+		$i       = 0;
 		$rootlen = strlen( $root ) + 1;
 		if ( is_dir( $root ) ) {
 			try {
@@ -190,10 +194,18 @@ final class Afimex_Nightly_Maintenance {
 					RecursiveIteratorIterator::CATCH_GET_CHILD
 				);
 				foreach ( $it as $file ) {
+					if ( $deadline && 0 === ( ++$i % 2048 ) && time() > $deadline ) {
+						$partial = true;
+						break;
+					}
 					if ( ! $file->isFile() ) {
 						continue;
 					}
-					$sz     = $file->getSize();
+					try {
+						$sz = $file->getSize();
+					} catch ( RuntimeException $e ) {
+						continue; // file vanished mid-walk — skip it, not the whole walk
+					}
 					$total += $sz;
 					$rel    = str_replace( '\\', '/', substr( $file->getPath(), $rootlen ) );
 					$parts  = ( '' === $rel ) ? array( '(root)' ) : explode( '/', $rel );
@@ -211,9 +223,10 @@ final class Afimex_Nightly_Maintenance {
 		} ), 0, 15, true );
 		$db = $this->db_bytes();
 		return array(
-			'files' => $total,
-			'db'    => $db,
-			'total' => $total + $db,
+			'files'   => $total,
+			'db'      => $db,
+			'total'   => $total + $db,
+			'partial' => $partial,
 		);
 	}
 
@@ -228,6 +241,95 @@ final class Afimex_Nightly_Maintenance {
 		if ( $gb >= $s['threshold_remove_old'] )  return 'REMOVE_OLD';
 		if ( $gb >= $s['threshold_aggressive'] )  return 'AGGRESSIVE';
 		return 'NORMAL';
+	}
+
+	/* ------------------------------------------------------------------ */
+	/* Run lock: token-owned, atomic acquire, CAS takeover, heartbeat      */
+	/* ------------------------------------------------------------------ */
+
+	private function acquire_lock() {
+		global $wpdb;
+		$this->lock_token = wp_generate_password( 12, false ) . '.' . getmypid();
+		$val = $this->lock_token . '|' . time();
+		$ok  = $wpdb->query( $wpdb->prepare(
+			"INSERT IGNORE INTO {$wpdb->options} (option_name, option_value, autoload) VALUES (%s, %s, 'no')",
+			self::LOCK_KEY, $val
+		) );
+		if ( 1 === (int) $ok ) {
+			wp_cache_delete( self::LOCK_KEY, 'options' );
+			return true;
+		}
+		$cur   = $wpdb->get_var( $wpdb->prepare(
+			"SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", self::LOCK_KEY
+		) );
+		$parts = explode( '|', (string) $cur );
+		$ts    = isset( $parts[1] ) ? (int) $parts[1] : 0;
+		// A live run refreshes its timestamp via heartbeat_lock(), so a
+		// timestamp older than an hour really is a crashed run.
+		if ( $ts > time() - HOUR_IN_SECONDS ) {
+			return false;
+		}
+		// Compare-and-swap on the exact observed value, so two takeover
+		// attempts cannot both win.
+		$rows = $wpdb->query( $wpdb->prepare(
+			"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value = %s",
+			$val, self::LOCK_KEY, (string) $cur
+		) );
+		if ( 1 === (int) $rows ) {
+			wp_cache_delete( self::LOCK_KEY, 'options' );
+			return true;
+		}
+		return false;
+	}
+
+	/** Refresh the lock timestamp so a long live run is never seen as stale. */
+	private function heartbeat_lock() {
+		global $wpdb;
+		if ( '' === $this->lock_token ) {
+			return;
+		}
+		$wpdb->query( $wpdb->prepare(
+			"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND option_value LIKE %s",
+			$this->lock_token . '|' . time(), self::LOCK_KEY, $wpdb->esc_like( $this->lock_token ) . '|%'
+		) );
+	}
+
+	/** Release only if we still own it — never clobber another run's lock. */
+	private function release_lock() {
+		global $wpdb;
+		if ( '' === $this->lock_token ) {
+			return;
+		}
+		$wpdb->query( $wpdb->prepare(
+			"DELETE FROM {$wpdb->options} WHERE option_name = %s AND option_value LIKE %s",
+			self::LOCK_KEY, $wpdb->esc_like( $this->lock_token ) . '|%'
+		) );
+		wp_cache_delete( self::LOCK_KEY, 'options' );
+		$this->lock_token = '';
+	}
+
+	/**
+	 * Fatal errors and hard PHP timeouts skip `finally`, but shutdown
+	 * functions still run. If a run dies mid-flight, release the lock and
+	 * record an ABORTED report so the next night is not blocked and the
+	 * operator can see what happened.
+	 */
+	public function on_shutdown() {
+		if ( $this->run_completed ) {
+			return;
+		}
+		$this->release_lock();
+		$report = wp_parse_args( (array) get_option( self::OPT_REPORT, array() ), array(
+			'storage_before' => '?', 'storage_after' => '?', 'storage_limit' => 40,
+			'tier' => 'UNKNOWN', 'reclaimed_gb' => 0, 'health_ok' => false, 'duration_s' => 0,
+		) );
+		$report['status'] = 'ABORTED';
+		$report['time']   = wp_date( 'Y-m-d H:i:s T' );
+		$report['mode']   = $this->dry_run ? 'DRY RUN' : 'EXECUTE';
+		$report['counts'] = $this->counts;
+		$this->log[]      = '[shutdown] Run aborted mid-flight (fatal error or PHP time limit). Lock released.';
+		$report['log']    = array_slice( $this->log, -400 );
+		update_option( self::OPT_REPORT, $report, false );
 	}
 
 	/* ------------------------------------------------------------------ */
@@ -247,14 +349,15 @@ final class Afimex_Nightly_Maintenance {
 		$deadline = $started + max( 60, (int) $s['max_runtime_seconds'] );
 
 		// --- Guard 1: no concurrent runs. ---------------------------------
-		if ( false === add_option( self::LOCK_KEY, time(), '', 'no' ) ) {
-			$lock = (int) get_option( self::LOCK_KEY );
-			if ( $lock > time() - HOUR_IN_SECONDS ) {
-				$this->log( 'ERROR', 'Another maintenance run holds the lock. Aborting.' );
-				return;
-			}
-			// Stale lock (crashed run) — take over.
-			update_option( self::LOCK_KEY, time(), 'no' );
+		if ( ! $this->acquire_lock() ) {
+			$this->log( 'ERROR', 'Another maintenance run holds the lock. Aborting.' );
+			return;
+		}
+		$this->run_completed = false;
+		static $shutdown_registered = false;
+		if ( ! $shutdown_registered ) {
+			$shutdown_registered = true;
+			register_shutdown_function( array( $this, 'on_shutdown' ) );
 		}
 
 		try {
@@ -269,7 +372,11 @@ final class Afimex_Nightly_Maintenance {
 			$this->log( 'INFO', 'Site time: ' . wp_date( 'Y-m-d H:i:s T' ) . ' | Mode: ' . ( $this->dry_run ? 'DRY RUN' : 'EXECUTE' ) );
 
 			// --- Monitor -------------------------------------------------
-			$before = $this->measure_storage();
+			$before = $this->measure_storage( $deadline );
+			$this->heartbeat_lock();
+			if ( ! empty( $before['partial'] ) ) {
+				$this->log( 'ERROR', 'Storage walk hit the runtime budget — totals are PARTIAL, tier may be understated.' );
+			}
 			$tier   = $this->storage_tier( $before['total'], $s );
 			$this->log( 'INFO', sprintf(
 				'Storage: %s GB total (files %s GB, database %s GB) of %d GB ceiling — tier %s',
@@ -286,13 +393,19 @@ final class Afimex_Nightly_Maintenance {
 
 			// --- Priority 1: transients, revisions, drafts, trash, spam ---
 			$this->cleanup_database( $s );
-			$this->cleanup_stale_files( $s );
+			$this->heartbeat_lock();
+			$this->cleanup_stale_files( $s, $deadline );
+			$this->heartbeat_lock();
 
 			// --- Priority 2: vehicles past the auction-date retention -----
 			$this->purge_vehicles( $s, $deadline );
 
 			// --- Recalculate ---------------------------------------------
-			$after = $this->measure_storage();
+			$after = $this->measure_storage( $deadline + 120 ); // small grace so the final number is complete
+			$this->heartbeat_lock();
+			if ( ! empty( $after['partial'] ) ) {
+				$this->log( 'ERROR', 'Post-cleanup storage walk was PARTIAL — reported totals are a lower bound.' );
+			}
 			$this->bytes_reclaimed = max( 0, $before['total'] - $after['total'] );
 			$tier_after = $this->storage_tier( $after['total'], $s );
 			$this->log( 'INFO', sprintf(
@@ -347,7 +460,8 @@ final class Afimex_Nightly_Maintenance {
 			}
 			$this->log( 'INFO', "STATUS: {$status}" );
 		} finally {
-			delete_option( self::LOCK_KEY );
+			$this->run_completed = true;
+			$this->release_lock();
 		}
 	}
 
@@ -465,7 +579,7 @@ final class Afimex_Nightly_Maintenance {
 	/* Filesystem cleanup (conservative: only regenerable/temp locations)  */
 	/* ------------------------------------------------------------------ */
 
-	private function cleanup_stale_files( $s ) {
+	private function cleanup_stale_files( $s, $deadline = 0 ) {
 		$this->log( 'INFO', '--- Cache / temp file cleanup ---' );
 		$content = untrailingslashit( WP_CONTENT_DIR );
 		$targets = array( $content . '/cache', $content . '/et-cache', $content . '/litespeed', $content . '/wphb-cache' );
@@ -485,6 +599,7 @@ final class Afimex_Nightly_Maintenance {
 			}
 			$stale = array();
 			$bytes = 0;
+			$i     = 0;
 			try {
 				$it = new RecursiveIteratorIterator(
 					new RecursiveDirectoryIterator( $dir, FilesystemIterator::SKIP_DOTS ),
@@ -492,9 +607,17 @@ final class Afimex_Nightly_Maintenance {
 					RecursiveIteratorIterator::CATCH_GET_CHILD
 				);
 				foreach ( $it as $f ) {
-					if ( $f->isFile() && $f->getMTime() < $cutoff ) {
-						$stale[] = $f->getPathname();
-						$bytes  += $f->getSize();
+					if ( $deadline && 0 === ( ++$i % 2048 ) && time() > $deadline ) {
+						$this->log( 'WARN', 'Runtime budget reached while scanning ' . basename( $dir ) . ' — remaining files next night.' );
+						break;
+					}
+					try {
+						if ( $f->isFile() && $f->getMTime() < $cutoff ) {
+							$stale[] = $f->getPathname();
+							$bytes  += $f->getSize();
+						}
+					} catch ( RuntimeException $e ) {
+						continue;
 					}
 				}
 			} catch ( Exception $e ) {
@@ -507,8 +630,14 @@ final class Afimex_Nightly_Maintenance {
 			$counts = &$this->counts;
 			$this->mutate(
 				sprintf( 'delete %d stale cache files under %s (%s GB)', $n, basename( $dir ), self::gb( $bytes ) ),
-				function () use ( $stale, &$counts ) {
+				function () use ( $stale, &$counts, $deadline ) {
+					$i = 0;
 					foreach ( $stale as $path ) {
+						if ( $deadline && 0 === ( ++$i % 2048 ) && time() > $deadline + 300 ) {
+							// Grace past the soft budget: finishing deletes frees
+							// space, but never run unbounded.
+							break;
+						}
 						if ( @unlink( $path ) ) {
 							$counts['files_deleted']++;
 						}
@@ -543,9 +672,17 @@ final class Afimex_Nightly_Maintenance {
 		if ( '' === $value || '0' === $value ) {
 			return false;
 		}
-		// Unix timestamp (9-11 digits => years 1973..5138).
+		// Unix timestamp — but only within a plausible auction window
+		// (now +/- 10 years). Any other 9-11 digit number is junk (an ID, a
+		// price, a phone fragment) and junk preserves the vehicle, never
+		// deletes it.
 		if ( ctype_digit( $value ) && strlen( $value ) >= 9 && strlen( $value ) <= 11 ) {
-			return (int) $value;
+			$ts  = (int) $value;
+			$now = time();
+			if ( $ts < $now - 10 * YEAR_IN_SECONDS || $ts > $now + 10 * YEAR_IN_SECONDS ) {
+				return false;
+			}
+			return $ts;
 		}
 		// ISO-ish: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS. Nothing else is guessed.
 		if ( preg_match( '/^(\d{4})-(\d{2})-(\d{2})( \d{2}:\d{2}(:\d{2})?)?$/', $value, $m ) ) {
@@ -584,13 +721,13 @@ final class Afimex_Nightly_Maintenance {
 
 		// Sanity check: most vehicles must carry the date key, or it is wrong.
 		$total = (int) $wpdb->get_var( $wpdb->prepare(
-			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s AND post_status NOT IN ('trash','auto-draft')",
+			"SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = %s AND post_status = 'publish'",
 			$ptype
 		) );
 		$dated = (int) $wpdb->get_var( $wpdb->prepare(
 			"SELECT COUNT(*) FROM {$wpdb->posts} p
 			 JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = %s AND pm.meta_value <> ''
-			 WHERE p.post_type = %s AND p.post_status NOT IN ('trash','auto-draft')",
+			 WHERE p.post_type = %s AND p.post_status = 'publish'",
 			$meta, $ptype
 		) );
 		$this->log( 'INFO', "Model check: {$total} '{$ptype}' posts, {$dated} carry '{$meta}'." );
@@ -607,7 +744,7 @@ final class Afimex_Nightly_Maintenance {
 		$rows = $wpdb->get_results( $wpdb->prepare(
 			"SELECT p.ID, pm.meta_value FROM {$wpdb->posts} p
 			 JOIN {$wpdb->postmeta} pm ON pm.post_id = p.ID AND pm.meta_key = %s
-			 WHERE p.post_type = %s AND p.post_status NOT IN ('trash','auto-draft') AND pm.meta_value <> ''",
+			 WHERE p.post_type = %s AND p.post_status = 'publish' AND pm.meta_value <> ''",
 			$meta, $ptype
 		) );
 
@@ -615,11 +752,15 @@ final class Afimex_Nightly_Maintenance {
 		$now       = time();
 		$eligible  = array();
 		$unparsed  = 0;
+		$future    = 0;
 		foreach ( $rows as $row ) {
 			$ts = self::parse_auction_date( $row->meta_value );
 			if ( false === $ts ) {
 				$unparsed++;
 				continue;
+			}
+			if ( $ts > $now ) {
+				$future++;
 			}
 			$age_days = (int) floor( ( $now - $ts ) / DAY_IN_SECONDS );
 			if ( $age_days > $retention ) {
@@ -631,13 +772,24 @@ final class Afimex_Nightly_Maintenance {
 		if ( $unparsed > 0 ) {
 			$this->log( 'WARN', "{$unparsed} vehicle(s) have unparseable '{$meta}' values — preserved, not guessed." );
 		}
-		$this->log( 'INFO', count( $eligible ) . " vehicle(s) past the {$retention}-day retention window." );
+		$this->log( 'INFO', count( $eligible ) . " vehicle(s) past the {$retention}-day retention window ({$future} have future auction dates)." );
 		if ( ! $eligible ) {
+			return;
+		}
+
+		// Plausibility refusal (guards against a wrong-but-parseable key):
+		// a genuine auction-date field on a live auction site always carries
+		// some upcoming dates. A key where NOTHING is in the future and nearly
+		// every vehicle is "expired" is almost certainly a created/listing
+		// date — purging on it would drain the entire inventory.
+		if ( 0 === $future && count( $eligible ) > 0.9 * $total ) {
+			$this->log( 'ERROR', "Refusing to purge: no '{$meta}' values lie in the future and " . count( $eligible ) . "/{$total} vehicles would be eligible. '{$meta}' looks like a listing/created date, not an auction date. Nothing was deleted." );
 			return;
 		}
 
 		$menu_ids = $this->menu_object_ids();
 		$front    = (int) get_option( 'page_on_front' );
+		$batch    = max( 1, (int) $s['purge_batch'] );
 
 		$done = 0;
 		foreach ( $eligible as $id => $ts ) {
@@ -649,6 +801,9 @@ final class Afimex_Nightly_Maintenance {
 			$post = get_post( $id );
 			if ( ! $post || $post->post_type !== $ptype ) {
 				continue;
+			}
+			if ( 'publish' !== $post->post_status ) {
+				continue; // status changed since the list was built — preserve
 			}
 			if ( $id === $front || isset( $menu_ids[ $id ] ) ) {
 				$this->log( 'WARN', "ID={$id} is the front page or in a menu — preserved." );
@@ -678,12 +833,22 @@ final class Afimex_Nightly_Maintenance {
 				$counts['vehicles_deleted']++;
 				$counts['pages_deleted']++;
 				if ( ! empty( $s['delete_vehicle_media'] ) ) {
-					$this->delete_unreferenced_attachments( $attachments );
+					$this->delete_unreferenced_attachments( $attachments, $deadline );
 				}
 			} elseif ( $ok && $this->dry_run ) {
 				$counts['vehicles_deleted']++; // counted as "would delete"
+				if ( ! empty( $s['delete_vehicle_media'] ) && $attachments ) {
+					$this->log( 'INFO', 'DRY-RUN: ' . count( $attachments ) . " attached image(s) of ID={$id} would be checked for deletion (referenced images are always preserved)." );
+				}
 			}
 			$done++;
+			if ( 0 === $done % 10 ) {
+				$this->heartbeat_lock();
+			}
+			if ( $done >= $batch ) {
+				$this->log( 'WARN', "Per-run cap of {$batch} vehicles reached; the rest continue next night." );
+				break;
+			}
 		}
 	}
 
@@ -710,35 +875,89 @@ final class Afimex_Nightly_Maintenance {
 		return array_unique( array_map( 'intval', $ids ) );
 	}
 
-	/** Delete attachments only when nothing else still references them. */
-	private function delete_unreferenced_attachments( array $ids ) {
+	/**
+	 * Is this attachment referenced ANYWHERE besides its own rows?
+	 * Deliberately over-matches: a false positive merely preserves a file,
+	 * a false negative destroys live imagery. Covers ID-based references
+	 * (featured images, gallery meta "512,513", serialized i:512;, JSON
+	 * "id":512 / "512", classic wp-image-512) and filename-stem references
+	 * (so every generated size like -300x200 counts), in both post content
+	 * and postmeta (Elementor/builder data lives in postmeta).
+	 */
+	private function attachment_is_referenced( $att ) {
 		global $wpdb;
+		$att  = (int) $att;
+		$file = get_post_meta( $att, '_wp_attached_file', true );
+		$base = $file ? wp_basename( $file ) : '';
+		$stem = $base ? preg_replace( '/\.[^.]+$/', '', $base ) : '';
+
+		$meta_conds  = array(
+			'meta_value = %s',        // plain ID (covers _thumbnail_id and ACF image fields)
+			'meta_value LIKE %s',     // JSON string "512"
+			'meta_value LIKE %s',     // PHP-serialized int i:512;
+			'meta_value LIKE %s',     // CSV first: 512,...
+			'meta_value LIKE %s',     // CSV last: ...,512
+			'meta_value LIKE %s',     // CSV middle: ...,512,...
+			'meta_value LIKE %s',     // JSON "id":512
+		);
+		$meta_params = array(
+			(string) $att,
+			'%"' . $att . '"%',
+			'%i:' . $att . ';%',
+			$att . ',%',
+			'%,' . $att,
+			'%,' . $att . ',%',
+			'%"id":' . $att . '%',
+		);
+		if ( '' !== $stem ) {
+			$meta_conds[]  = 'meta_value LIKE %s'; // builder URLs stored in meta
+			$meta_params[] = '%' . $wpdb->esc_like( $stem ) . '%';
+		}
+		$hit = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE post_id <> %d AND ( " . implode( ' OR ', $meta_conds ) . ' )',
+			array_merge( array( $att ), $meta_params )
+		) );
+		if ( $hit > 0 ) {
+			return true;
+		}
+
+		$content_conds  = array(
+			'post_content LIKE %s', // classic editor: wp-image-512
+			'post_content LIKE %s', // Gutenberg block JSON: "id":512
+			'post_content LIKE %s', // [gallery ids="...,512,..."]
+		);
+		$content_params = array(
+			'%wp-image-' . $att . '%',
+			'%"id":' . $att . '%',
+			'%,' . $att . ',%',
+		);
+		if ( '' !== $stem ) {
+			$content_conds[]  = 'post_content LIKE %s';
+			$content_params[] = '%' . $wpdb->esc_like( $stem ) . '%';
+		}
+		$hit = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT COUNT(*) FROM {$wpdb->posts}
+			 WHERE ID <> %d AND post_status IN ('publish','future','private','draft','pending')
+			   AND ( " . implode( ' OR ', $content_conds ) . ' )',
+			array_merge( array( $att ), $content_params )
+		) );
+		return $hit > 0;
+	}
+
+	/** Delete attachments only when nothing else still references them. */
+	private function delete_unreferenced_attachments( array $ids, $deadline = 0 ) {
 		foreach ( $ids as $att ) {
+			if ( $deadline && time() > $deadline + 300 ) {
+				$this->log( 'WARN', 'Runtime budget reached during media cleanup — remaining attachments next night.' );
+				break;
+			}
 			$post = get_post( $att );
 			if ( ! $post || 'attachment' !== $post->post_type ) {
 				continue;
 			}
-			// Still someone's featured image?
-			$used = (int) $wpdb->get_var( $wpdb->prepare(
-				"SELECT COUNT(*) FROM {$wpdb->postmeta} WHERE meta_key = '_thumbnail_id' AND meta_value = %s",
-				(string) $att
-			) );
-			if ( $used > 0 ) {
+			if ( $this->attachment_is_referenced( $att ) ) {
+				$this->log( 'INFO', "Attachment {$att} is still referenced elsewhere — preserved." );
 				continue;
-			}
-			// Referenced by filename in any live post content?
-			$file = get_post_meta( $att, '_wp_attached_file', true );
-			$base = $file ? wp_basename( $file ) : '';
-			if ( $base ) {
-				$like = '%' . $wpdb->esc_like( $base ) . '%';
-				$refs = (int) $wpdb->get_var( $wpdb->prepare(
-					"SELECT COUNT(*) FROM {$wpdb->posts}
-					 WHERE post_status IN ('publish','future','private','draft') AND post_content LIKE %s",
-					$like
-				) );
-				if ( $refs > 0 ) {
-					continue;
-				}
 			}
 			if ( wp_delete_attachment( $att, true ) ) {
 				$this->counts['images_deleted']++;
@@ -814,8 +1033,9 @@ final class Afimex_Nightly_Maintenance {
 		if ( ! current_user_can( 'manage_options' ) || ! check_admin_referer( 'anm_save_settings' ) ) {
 			wp_die( 'Not allowed.' );
 		}
-		$in = wp_unslash( $_POST );
-		$s  = self::settings();
+		$in  = wp_unslash( $_POST );
+		$old = self::settings();
+		$s   = $old;
 		$s['dry_run']              = empty( $in['execute_mode'] ) ? 1 : 0;
 		$s['vehicle_post_type']    = sanitize_key( $in['vehicle_post_type'] ?? '' );
 		$s['auction_date_meta']    = sanitize_text_field( $in['auction_date_meta'] ?? '' );
@@ -825,8 +1045,19 @@ final class Afimex_Nightly_Maintenance {
 		$s['threshold_remove_old'] = max( 1, (int) ( $in['threshold_remove_old'] ?? 38 ) );
 		$s['delete_vehicle_media'] = empty( $in['delete_vehicle_media'] ) ? 0 : 1;
 		$s['clean_ewww_backups']   = empty( $in['clean_ewww_backups'] ) ? 0 : 1;
+		$s['purge_batch']          = max( 1, (int) ( $in['purge_batch'] ?? $old['purge_batch'] ) );
+
+		// A new purge target must prove itself in a dry run first, even on a
+		// site already running in execute mode: the first run after changing
+		// the post type or the auction-date key is always report-only.
+		$forced = 0;
+		if ( ( $s['vehicle_post_type'] !== $old['vehicle_post_type'] || $s['auction_date_meta'] !== $old['auction_date_meta'] )
+			&& '' !== $s['vehicle_post_type'] && ! $s['dry_run'] ) {
+			$s['dry_run'] = 1;
+			$forced       = 1;
+		}
 		update_option( self::OPT_SETTINGS, $s, false );
-		wp_safe_redirect( admin_url( 'tools.php?page=anm-maintenance&saved=1' ) );
+		wp_safe_redirect( admin_url( 'tools.php?page=anm-maintenance&saved=1' . ( $forced ? '&forced_dry=1' : '' ) ) );
 		exit;
 	}
 
@@ -874,6 +1105,7 @@ final class Afimex_Nightly_Maintenance {
 			<h1>Nightly Maintenance</h1>
 			<?php if ( ! empty( $_GET['saved'] ) ) : ?><div class="notice notice-success"><p>Settings saved.</p></div><?php endif; ?>
 			<?php if ( ! empty( $_GET['ran'] ) ) : ?><div class="notice notice-success"><p>Run finished — report below.</p></div><?php endif; ?>
+			<?php if ( ! empty( $_GET['forced_dry'] ) ) : ?><div class="notice notice-warning"><p>The vehicle purge target changed, so the plugin switched itself back to <strong>DRY RUN</strong>. Review the next dry-run report, then re-enable Execute mode.</p></div><?php endif; ?>
 
 			<p>
 				<strong>Mode:</strong>
@@ -942,6 +1174,7 @@ final class Afimex_Nightly_Maintenance {
 						</td>
 					</tr>
 					<tr><th>Retention (days)</th><td><input name="retention_days" type="number" min="1" value="<?php echo (int) $s['retention_days']; ?>" style="width:80px"> Vehicles are deleted only when the auction date is MORE than this many days old.</td></tr>
+				<tr><th>Vehicles per night (cap)</th><td><input name="purge_batch" type="number" min="1" value="<?php echo (int) $s['purge_batch']; ?>" style="width:80px"> Hard cap on vehicles permanently deleted in a single nightly run.</td></tr>
 					<tr><th>Storage ceiling (GB)</th><td><input name="storage_limit_gb" type="number" min="1" value="<?php echo (int) $s['storage_limit_gb']; ?>" style="width:80px"></td></tr>
 					<tr><th>Aggressive at (GB)</th><td><input name="threshold_aggressive" type="number" min="1" value="<?php echo (int) $s['threshold_aggressive']; ?>" style="width:80px"></td></tr>
 					<tr><th>Remove old at (GB)</th><td><input name="threshold_remove_old" type="number" min="1" value="<?php echo (int) $s['threshold_remove_old']; ?>" style="width:80px"></td></tr>
